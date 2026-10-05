@@ -7,18 +7,36 @@ Create the solution skeleton, then build the metadata extractor. It connects to 
 - Read AGENTS.md first. Windows corporate machine, no admin rights, dotnet CLI only. Target net10.0 (net9.0 only if net10.0 is unavailable; record it in DECISIONS.md).
 - You may not be able to reach the SSAS server or the network. If a command needs the network (for example NuGet restore) and fails, STOP and tell me exactly what failed.
 - Never invent NuGet package IDs, method signatures or rowset column names. Verify from package metadata or documentation. Anything you cannot verify goes behind one small class and is listed in DECISIONS.md as UNVERIFIED.
-- Authentication is Windows Integrated. Never write passwords or connection strings to files, logs or console output, including error messages.
+- Authentication is Windows Integrated only. Never write passwords or other secrets to files, logs or console output, and never echo a connection string or profile contents in an error message. Configuration files hold only non-secret settings (server, database, cube name, non-secret options).
 - Do not query $SYSTEM DMVs (they need server admin rights). Use the client library's schema-rowset API, the discovery mechanism Excel's field list relies on. I expect it works with ordinary read access; docs/VERIFY.md must tell me how to confirm that.
 - SSAS client: ADOMD.NET from NuGet. I believe the modern-.NET package id is Microsoft.AnalysisServices.AdomdClient.NetCore.retail.amd64 (verify it).
 
 ## Solution to create
-Root: `XYZ.AQBE.sln`, `Directory.Build.props` (net10.0, nullable enabled, TreatWarningsAsErrors, Company XYZ, deterministic builds), `.gitignore` if missing, README.md, DECISIONS.md, docs/METADATA-SCHEMA.md, docs/VERIFY.md.
+Root: `XYZ.AQBE.sln`, `Directory.Build.props` (net10.0, nullable enabled, TreatWarningsAsErrors, Company XYZ, deterministic builds), `.gitignore` if missing (add `config.json` and `*.local.json` as safeguards; do NOT ignore config.sample.json or samples/), README.md, DECISIONS.md, config.sample.json, docs/METADATA-SCHEMA.md, docs/CONFIGURATION.md, docs/VERIFY.md.
 Projects (assembly name = namespace = project name; file-scoped namespaces, XML docs on public types, immutable records):
 - `src/XYZ.AQBE.Model`: ZERO dependencies. Namespace `XYZ.AQBE.Model.Metadata`: the snapshot records, JSON load/save, and the snapshot integrity validator. Later specs add more types to this project.
-- `src/XYZ.AQBE.Metadata`: IRowsetSource, AdomdRowsetSource, CsvRowsetSource, SnapshotBuilder, connection-string helper. References Model and the ADOMD package. This is the ONLY project that may reference ADOMD.
+- `src/XYZ.AQBE.Metadata`: ConnectionSettings, ConnectionResolver, config loading, IRowsetSource, AdomdRowsetSource, CsvRowsetSource, SnapshotBuilder. References Model and the ADOMD package. This is the ONLY project that may reference ADOMD.
 - `src/XYZ.AQBE.Cli`: console app, assembly name `aqbe`, command group `metadata`. Hand-rolled argument parsing (no CLI framework packages). Keep it thin; logic lives in the libraries.
 - `tests/XYZ.AQBE.Model.Tests` and `tests/XYZ.AQBE.Metadata.Tests` (xUnit only).
 Do NOT create other projects (Mdx, Sampling, Dax, App, ExcelAddin come from later specs); just list them in the README as planned.
+
+## Connection settings and config
+- `ConnectionSettings { Server, Database, CubeName?, ExtraProperties }` (in XYZ.AQBE.Metadata) is the only thing AdomdRowsetSource accepts. A `ConnectionResolver` produces it from any of the sources below. The future Excel add-in will build it from a workbook connection, so do not couple it to the CLI.
+- Resolution order (first match wins): `--connection "<string>"`; env var `CUBE_CONNECTION`; `--profile <name>` from the config file; the config's `defaultProfile`. If none match, fail with a usage message that lists these sources.
+- A raw connection string (from the first two sources) is parsed into ConnectionSettings. Strip a leading `OLEDB;`. Accept the keywords Excel uses for server and database (Data Source, Initial Catalog / Catalog) case-insensitively. Keep other keywords in ExtraProperties. Drop `Provider=` and document that. Reject any keyword that looks like a password (password, pwd) with a clear error that does not echo the value.
+- Config file: JSON, default location `%APPDATA%\XYZ\AQBE\config.json`; override with `--config <path>` or env var `AQBE_CONFIG`. Shape:
+```json
+{
+  "schemaVersion": 1,
+  "defaultProfile": "ers",
+  "profiles": {
+    "ers": { "server": "SRV01", "database": "ERS_DB", "cube": "ERS_Cube", "extraProperties": { } }
+  }
+}
+```
+- The loader ignores unknown properties, but rejects any key (at any level, case-insensitive) containing "password" or "pwd", and an unsupported schemaVersion, reporting all problems together without echoing values.
+- The connection string passed to ADOMD is built from ConnectionSettings with Windows Integrated authentication. The exact keywords are UNVERIFIED: check the ADOMD docs and log in DECISIONS.md.
+- Provide `config.sample.json` in the repo root and document the config in docs/CONFIGURATION.md (locations, resolution order, what must never go in it).
 
 ## Architecture (the live connection is a thin, isolated layer)
 - `IRowsetSource.GetRows(string rowsetName, IReadOnlyDictionary<string,string>? restrictions)` returns rows as case-insensitive column-name to value maps.
@@ -80,10 +98,11 @@ Determinism: sort dimensions, hierarchies and measures by uniqueName (ordinal); 
 Unique names unique (case-insensitive) within their kind; every hierarchy belongs to a listed dimension and every level to a listed hierarchy; level numbers unique within a hierarchy; `schemaVersion` supported; no empty unique names. Report ALL problems, not just the first.
 
 ## CLI
-- `aqbe metadata extract --connection "<string>" --cube <name> --out <file> [--no-timestamp]`. The connection may come from env var `CUBE_CONNECTION` instead. Accept an Excel-style string with a leading `OLEDB;` prefix by stripping it. If ADOMD rejects a `Provider=` keyword, remove it and document that.
+- `aqbe metadata extract [--connection "<string>"] [--profile <name>] [--config <path>] [--cube <name>] --out <file> [--no-timestamp]`. Connection settings are resolved per "Connection settings and config". `--cube` is optional if the selected profile defines one; if both are given, `--cube` wins.
 - `aqbe metadata extract --from-csv <dir> --cube <name> --out <file> [--no-timestamp]`
+- `aqbe metadata profiles [--config <path>]`: lists profile names with their server, database and cube. Nothing else.
 - `aqbe metadata validate <file>` and `aqbe metadata summary <file>` (counts of dimensions, hierarchies, levels, measures, hidden items, and hierarchies whose default is not All).
-Only server and database/catalog go into `source`, parsed from the connection string. Exit codes: 0 ok, 1 failure, 2 usage error. Error messages must never echo the connection string.
+Only server and database go into the snapshot's `source`. Exit codes: 0 ok, 1 failure, 2 usage error. Error messages must never echo a connection string or raw config contents.
 
 ## Tests (xUnit; no server needed)
 - Synthetic CSV fixtures for a small cube: 3 dimensions (one with an attribute hierarchy, one with a user hierarchy and an All level), a hidden hierarchy, a hierarchy with no All member, a perspective row and a dimension-cube row in the cubes rowset (must be ignored), measures including a calculated one, plus one fixture with some optional columns missing.
@@ -91,15 +110,18 @@ Only server and database/catalog go into `source`, parsed from the connection st
 - Shuffled CSV row order gives identical output.
 - Load then save equals the original.
 - Integrity validator: one test per rule, and several problems reported together.
-- Connection string: server and catalog parsed; a password in the input never appears in any output, log or exception message.
+- Connection resolution: each source winning in turn (connection string, env var, profile, default profile); no source at all gives a usage message listing the sources; a missing profile name lists the valid names; cube from the profile versus `--cube`.
+- Connection strings: `OLEDB;` prefix stripped; keyword aliases for server and database; `Provider=` dropped; password-like keywords rejected without echoing the value.
+- Config file: two profiles and a default; unknown properties ignored; password-like keys rejected at any depth (value never in the message); unsupported schemaVersion; several problems reported together.
+- Nothing secret appears in any output, log or exception message in any of the above tests.
 - CSV parser: quotes, embedded commas and newlines, BOM, `.tsv`.
 - The live AdomdRowsetSource is not unit tested; keep it as small as possible.
 
 ## Docs
-README (usage and planned projects); DECISIONS.md (every non-obvious decision and everything UNVERIFIED); docs/METADATA-SCHEMA.md; docs/VERIFY.md: a checklist for me against the real cube: (1) run `extract` with my own Windows account, no admin; (2) compare dimension, hierarchy, level and measure counts with the same rowsets in SSMS; (3) spot-check three hierarchies' default members with an MDX DefaultMember query; (4) confirm perspectives aren't mistaken for cubes; (5) note the run time.
+README (usage and planned projects); DECISIONS.md (every non-obvious decision and everything UNVERIFIED); config.sample.json; docs/CONFIGURATION.md; docs/METADATA-SCHEMA.md; docs/VERIFY.md: a checklist for me against the real cube: (1) create my config from config.sample.json and run `aqbe metadata profiles`; (2) run `extract` with my own Windows account, no admin; (3) compare dimension, hierarchy, level and measure counts with the same rowsets in SSMS; (4) spot-check three hierarchies' default members with an MDX DefaultMember query; (5) confirm perspectives aren't mistaken for cubes; (6) note the run time; (7) confirm the connection keywords ADOMD accepted, and record them.
 
 ## Non-goals
 No members, no data queries, no MDX, no UI, no reading the connection from Excel, nothing writable on the server.
 
 ## Process
-Propose a short plan and wait for my approval. Then implement in this order: skeleton and Model records with JSON; integrity validator; CSV source; SnapshotBuilder; CLI; ADOMD source; docs. Run `dotnet build` and `dotnet test` after each step; finish with no failures or warnings. Decide small things yourself and log them. End with a short report: what was built, test counts, UNVERIFIED items, open questions.
+Propose a short plan and wait for my approval. Then implement in this order: skeleton and Model records with JSON; integrity validator; CSV source; SnapshotBuilder; ConnectionSettings, resolver and config; CLI; ADOMD source; docs. Run `dotnet build` and `dotnet test` after each step; finish with no failures or warnings. Decide small things yourself and log them. End with a short report: what was built, test counts, UNVERIFIED items, open questions.
